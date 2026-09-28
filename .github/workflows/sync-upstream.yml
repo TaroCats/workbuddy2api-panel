@@ -51,6 +51,8 @@ env:
   # 万一被误删能立刻红灯报警，而不是悄悄失效。
   FORK_FILES: |
     .github/workflows/sync-upstream.yml
+    .github/workflows/docker-fork.yml
+    Dockerfile.fork
     docker-compose.fork.yml
     scripts/selfupdate.py
     scripts/selfupdate-entrypoint.sh
