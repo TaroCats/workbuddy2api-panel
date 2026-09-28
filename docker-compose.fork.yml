@@ -1,0 +1,60 @@
+# docker-compose.fork.yml —— fork 专属部署文件（上游 linguo2625469/workbuddy2api-panel 没有这个文件）
+#
+# 与基础 docker-compose.yml 的关系：**不要叠加使用**。
+#   正确：docker compose -f docker-compose.fork.yml up -d
+#   错误：docker compose -f docker-compose.yml -f docker-compose.fork.yml up -d
+#          → 服务同时带 build: 和 image:，compose 会走本地源码构建，拉镜像那条路就白搭了。
+#   基础文件保持上游原样未改，想回退就换回 `docker compose up -d`。
+#
+# 与基础文件的三点差异：
+#   1. 用 image: 指向 CI 构建并推送到 GHCR 的镜像（基础文件只有 build:，compose 会起一个
+#      本地默认镜像名，跟 GHCR 上的 tag 对不上，没法 pull）。
+#   2. 挂载 /var/run/docker.sock + 覆盖 entrypoint，启用容器内自更新（见 scripts/selfupdate.py）。
+#   3. 默认以 root 运行：自更新要写 docker.sock，非 root 用户通常没权限。
+#
+#   ⚠️ 注意：挂 docker.sock 等于把宿主机 root 权限交给这个容器（能起特权容器、能挂宿主机根目录）。
+#      既然已经交了 root，再把容器内用户设成 uid 10001 就只是心理安慰，所以这里默认 root。
+#      想收紧的话两条路：① 不挂 socket（把 SELF_UPDATE 设为 0，手动更新）；
+#      ② 保留 user: 10001 并加 group_add，让容器用户进 docker 组：
+#         DOCKER_GID=$(stat -c '%g' /var/run/docker.sock) docker compose -f docker-compose.fork.yml up -d
+#
+# 首次部署：
+#   cp config.example.json config.json
+#   docker compose -f docker-compose.fork.yml pull
+#   docker compose -f docker-compose.fork.yml up -d
+services:
+  wb2api:
+    image: ${WB2API_IMAGE:-ghcr.io/tarocats/workbuddy2api-panel:latest}
+    container_name: workbuddy2api
+    restart: unless-stopped
+    user: "${PUID:-0}:${PGID:-0}"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      # ---- 容器内自更新 ----
+      - SELF_UPDATE=${SELF_UPDATE:-1}
+      - SELF_UPDATE_IMAGE=${SELF_UPDATE_IMAGE:-ghcr.io/tarocats/workbuddy2api-panel:latest}
+      # 检查间隔（秒），默认 6 小时；另有 0~600 秒随机抖动，避免多台机器同刻拉取
+      - SELF_UPDATE_INTERVAL=${SELF_UPDATE_INTERVAL:-21600}
+      - SELF_UPDATE_JITTER=${SELF_UPDATE_JITTER:-600}
+      # 1 = 更新成功后清理 dangling 旧镜像（默认 0，留一份可回滚的旧镜像）
+      - SELF_UPDATE_PRUNE=${SELF_UPDATE_PRUNE:-0}
+      - DOCKER_SOCK=/var/run/docker.sock
+      - SELF_UPDATE_SCRIPT=/app/scripts/selfupdate.py
+      - WB2API_CONFIG=/app/config.json
+      # 私有 GHCR 包才需要（公开包留空即可）
+      - SELF_UPDATE_USERNAME=${SELF_UPDATE_USERNAME:-}
+      - SELF_UPDATE_TOKEN=${SELF_UPDATE_TOKEN:-}
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # 宿主机必须先有 config.json（cp config.example.json config.json），
+      # 否则 Docker 会把挂载点建成目录 → 容器启动失败
+      - ./config.json:/app/config.json
+      # 自更新脚本走 bind mount：改脚本不用重建镜像（镜像本身不含它）
+      - ./scripts/selfupdate.py:/app/scripts/selfupdate.py:ro
+      - ./scripts/selfupdate-entrypoint.sh:/app/selfupdate-entrypoint.sh:ro
+      # 自更新需要直连 docker daemon 创建/替换容器
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["/bin/bash", "/app/selfupdate-entrypoint.sh"]

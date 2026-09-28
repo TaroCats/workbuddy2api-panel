@@ -1,0 +1,190 @@
+# sync-upstream.yml —— fork 专属工作流（上游 linguo2625469/workbuddy2api-panel 没有这个文件）
+#
+# 职责：定时检测上游（fork 源）是否有新提交，有就同步过来，再派发 docker-ghcr.yml
+#       重新构建镜像并推送到 GHCR（ghcr.io/tarocats/workbuddy2api-panel）。
+#
+# 同步策略：快进优先 + 线性 rebase 兜底（不产生 merge 提交，不丢 fork 本地提交）
+#   1. 上游没新提交（upstream/main 已是 HEAD 的祖先）→ 什么都不做，不提交不推送（幂等）
+#   2. fork 无本地提交、纯落后 → git merge --ff-only（真·快进，push 无需 force）
+#   3. fork 既有本地提交又落后 → git rebase upstream/main 把本地提交线性重放到上游之上
+#      → 提交号被改写，push 需要 --force-with-lease
+#   4. rebase 冲突 → git rebase --abort 并 exit 1（宁可不更新，也不推半成品）
+#
+# 为什么不用「硬重置完全镜像」：硬重置会把 fork 独有的文件（含本文件自己）删掉，
+# 必须额外维护一份 FORK_FILES 覆盖层回填清单。rebase 天然保留本地提交，无需清单 ——
+# 代价是要求 fork 的本地提交与上游改动不冲突。
+#
+# 为什么推送后还要显式派发构建：由 GITHUB_TOKEN 产生的 push 不会触发其他 workflow
+# （GitHub 的防递归限制），只有 workflow_dispatch / repository_dispatch 是例外。
+
+name: sync-upstream
+
+on:
+  schedule:
+    # 北京时间 11:37 / 23:37（UTC 03:37 / 15:37）。刻意避开整点：GitHub schedule
+    # 在整点排队严重，实测会迟到甚至被静默丢弃。
+    - cron: "37 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "上游无新提交时也强制重建镜像（用于单独验证构建链路）"
+        required: false
+        type: boolean
+        default: false
+
+# contents: write → 推送同步结果；actions: write → 派发 docker-ghcr.yml
+permissions:
+  contents: write
+  actions: write
+
+# 同一时刻只允许一趟同步，避免两次运行互相 force push
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: linguo2625469/workbuddy2api-panel
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+  BUILD_WORKFLOW: docker-ghcr.yml
+  # fork 专属文件（上游没有）。rebase 策略下正常不会被删；这里做存在性断言，
+  # 万一被误删能立刻红灯报警，而不是悄悄失效。
+  FORK_FILES: |
+    .github/workflows/sync-upstream.yml
+    docker-compose.fork.yml
+    scripts/selfupdate.py
+    scripts/selfupdate-entrypoint.sh
+    FORK.md
+
+jobs:
+  sync:
+    name: 同步上游并触发构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: 同步上游
+        id: sync
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+
+          echo "::group::拉取上游"
+          git fetch --no-tags --prune upstream "${UPSTREAM_BRANCH}"
+          echo "::endgroup::"
+
+          UP_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          ORIG="$(git rev-parse HEAD)"
+          BEHIND="$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")"
+          AHEAD="$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD")"
+
+          CHANGED=false
+          MODE=skip
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "上游无新提交（fork 已包含 upstream/${UPSTREAM_BRANCH}@${UP_SHA:0:7}），跳过同步"
+          else
+            if [ "$AHEAD" -eq 0 ]; then
+              MODE=ff
+              echo "纯快进：fork 无本地提交，git merge --ff-only upstream/${UPSTREAM_BRANCH}"
+              git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
+            else
+              MODE=rebase
+              echo "fork 有 ${AHEAD} 个本地提交 → git rebase upstream/${UPSTREAM_BRANCH}（线性重放）"
+              git -c user.name='github-actions[bot]' \
+                  -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                  rebase "upstream/${UPSTREAM_BRANCH}" || {
+                echo "::error::rebase 冲突：上游改动与 fork 本地提交冲突，已中止，fork 未被修改。请人工处理后再跑一次。"
+                git rebase --abort || true
+                exit 1
+              }
+            fi
+
+            echo "::group::fork 专属文件存在性断言"
+            # 只在 fork 确实带本地提交时断言：AHEAD==0 说明这个 fork 是纯镜像
+            # （根本没有 fork 专属文件），此时不该拦。
+            if [ "$AHEAD" -eq 0 ]; then
+              echo "  纯镜像 fork（无本地提交），跳过断言"
+            else
+              while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                [ -f "$f" ] || { echo "::error::fork 专属文件丢失：${f}"; exit 1; }
+                echo "  ok   ${f}"
+              done <<< "${FORK_FILES}"
+            fi
+            echo "::endgroup::"
+
+            echo "::group::推送到 origin（fork）"
+            if [ "$MODE" = rebase ]; then
+              # rebase 改写了提交号 → 只能 force push；用 --force-with-lease，
+              # 若远端在本 run 之后又有人推过，会故意拒绝而不是覆盖别人的提交。
+              git push --force-with-lease origin "HEAD:${TARGET_BRANCH}"
+            else
+              git push origin "HEAD:${TARGET_BRANCH}"
+            fi
+            echo "::endgroup::"
+            CHANGED=true
+          fi
+
+          {
+            echo "### sync-upstream"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` | \`${UP_SHA:0:7}\` |"
+            echo "| 同步前 fork \`${TARGET_BRANCH}\` | \`${ORIG:0:7}\` |"
+            echo "| 上游领先 / fork 领先 | ${BEHIND} / ${AHEAD} |"
+            echo "| 处理方式 | ${MODE} |"
+            echo "| 是否发生同步 | $([ "$CHANGED" = true ] && echo '是' || echo '否') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UP_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: 触发镜像构建
+        if: steps.sync.outputs.changed == 'true' || inputs.force == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # --repo 必须显式给：上面给仓库加了一个名为 upstream 的 remote，gh 解析
+          # 「当前仓库」时会挑中它，请求就打到了上游仓库，而 GITHUB_TOKEN 只对 fork
+          # 有权限 → 403 Resource not accessible by integration。
+          # 用内置 GITHUB_REPOSITORY 钉死目标，别依赖 remote 猜测。
+          #
+          # 这里不吞错误：派发失败就让任务红灯，否则会出现「绿勾但构建从未被触发」的假象。
+          if ! gh workflow run "${BUILD_WORKFLOW}" \
+                 --repo "${GITHUB_REPOSITORY}" \
+                 --ref "${TARGET_BRANCH}"; then
+            {
+              echo "::error::派发 ${BUILD_WORKFLOW} 失败。排查顺序："
+              echo "::error::  1) 该 workflow 是否被禁用（fork 里上游自带 workflow 的初始状态可能是 disabled_fork）"
+              echo "::error::  2) 它是否声明了 workflow_dispatch 触发器"
+              echo "::error::  3) 兜底：它自身带 schedule，下次定时仍会产出 latest"
+            }
+            exit 1
+          fi
+          echo "已派发 ${BUILD_WORKFLOW}（${GITHUB_REPOSITORY}@${TARGET_BRANCH}），构建约需 5-15 分钟。"
+
+          # 尽力回显本次派生的 run 链接（拿不到不算失败）
+          sleep 5
+          RUN_URL="$(gh run list --repo "${GITHUB_REPOSITORY}" \
+                       --workflow "${BUILD_WORKFLOW}" --limit 1 \
+                       --json url --jq '.[0].url' 2>/dev/null || true)"
+          if [ -n "${RUN_URL}" ]; then
+            echo "构建 run：${RUN_URL}"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "构建 run：${RUN_URL}" >> "$GITHUB_STEP_SUMMARY"
+          fi
