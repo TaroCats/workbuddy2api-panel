@@ -118,18 +118,21 @@ jobs:
           docker image inspect --format '{{.Config.Entrypoint}}' "$IMG" | grep -q 'selfupdate-entrypoint.sh' \
             || { echo "::error::镜像 ENTRYPOINT 不是 fork 的入口包装"; exit 1; }
 
-          echo "=== 容器内断言（覆盖当初那个 Is a directory 的失败模式）==="
+          echo "=== 容器内断言（以镜像默认用户 app 跑，覆盖当初那个 Is a directory 的失败模式）==="
           docker run --rm --network none --entrypoint /bin/bash "$IMG" -c '
             set -eu
+            echo "  当前用户：$(id -un)($(id -u))"
             for f in /app/wb2api /app/scripts/selfupdate.py /app/selfupdate-entrypoint.sh; do
-              [ -f "$f" ] || { echo "缺文件：$f"; exit 1; }
+              [ -f "$f" ] || { echo "  缺文件：$f"; exit 1; }
+              [ -r "$f" ] || { echo "  读不到：$f —— 镜像里权限不对"; exit 1; }
             done
-            [ -x /app/wb2api ] || { echo "/app/wb2api 不可执行"; exit 1; }
-            command -v bash    >/dev/null || { echo "缺 bash";    exit 1; }
-            command -v python3 >/dev/null || { echo "缺 python3"; exit 1; }
-            command -v wget    >/dev/null || echo "  （提示：基础镜像的 HEALTHCHECK 用 wget）"
-            python3 -m py_compile /app/scripts/selfupdate.py
+            [ -x /app/wb2api ] || { echo "  /app/wb2api 不可执行"; exit 1; }
+            command -v bash    >/dev/null || { echo "  缺 bash";    exit 1; }
+            command -v python3 >/dev/null || { echo "  缺 python3"; exit 1; }
+            # 字节码缓存引到 /tmp：/app/scripts 是 root 所有，非 root 用户本来就写不进去；
+            # selfupdate.py 只 import 标准库、运行时也不需要写那里，所以这不算问题。
+            PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile /app/scripts/selfupdate.py
             bash -n /app/selfupdate-entrypoint.sh
-            echo "容器内自检 SMOKE_OK"
+            echo "  容器内自检 SMOKE_OK"
           '
           echo "冒烟测试通过：$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMG")"
