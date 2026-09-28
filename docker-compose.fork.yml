@@ -6,13 +6,18 @@
 #          → 服务同时带 build: 和 image:，compose 会走本地源码构建，拉镜像那条路就白搭了。
 #   基础文件保持上游原样未改，想回退就换回 `docker compose up -d`。
 #
-# 与基础文件的三点差异：
-#   1. 用 image: 指向 CI 构建并推送到 GHCR 的镜像（基础文件只有 build:，compose 会起一个
-#      本地默认镜像名，跟 GHCR 上的 tag 对不上，没法 pull）。
-#   2. 挂载 /var/run/docker.sock + 覆盖 entrypoint，启用容器内自更新（见 scripts/selfupdate.py）。
-#   3. 默认以 root 运行：自更新要写 docker.sock，非 root 用户通常没权限。
+# 用的镜像：ghcr.io/tarocats/workbuddy2api-panel:latest-fork
+#   = 上游基础镜像（:latest）+ 自更新脚本 + 入口包装，由 .github/workflows/docker-fork.yml 叠出来。
+#   所以**宿主机上不需要存在任何脚本文件**，只需 pull。
+#   注意 :latest 是纯上游镜像（不含自更新脚本），别混用；真用了会立刻报
+#   `/app/selfupdate-entrypoint.sh: No such file or directory`（刻意保留的响亮失败，
+#   总好过静默变成「没有自更新」）。要纯上游镜像就跑基础 compose。
 #
-#   ⚠️ 注意：挂 docker.sock 等于把宿主机 root 权限交给这个容器（能起特权容器、能挂宿主机根目录）。
+# 与基础文件的其他差异：
+#   1. 挂载 /var/run/docker.sock，启用容器内自更新（见 scripts/selfupdate.py）。
+#   2. 默认以 root 运行：自更新要写 docker.sock，非 root 用户通常没权限。
+#
+#   ⚠️ 挂 docker.sock 等于把宿主机 root 权限交给这个容器（能起特权容器、能挂宿主机根目录）。
 #      既然已经交了 root，再把容器内用户设成 uid 10001 就只是心理安慰，所以这里默认 root。
 #      想收紧的话两条路：① 不挂 socket（把 SELF_UPDATE 设为 0，手动更新）；
 #      ② 保留 user: 10001 并加 group_add，让容器用户进 docker 组：
@@ -24,7 +29,7 @@
 #   docker compose -f docker-compose.fork.yml up -d
 services:
   wb2api:
-    image: ${WB2API_IMAGE:-ghcr.io/tarocats/workbuddy2api-panel:latest}
+    image: ${WB2API_IMAGE:-ghcr.io/tarocats/workbuddy2api-panel:latest-fork}
     container_name: workbuddy2api
     restart: unless-stopped
     user: "${PUID:-0}:${PGID:-0}"
@@ -32,7 +37,8 @@ services:
       - TZ=${TZ:-Asia/Shanghai}
       # ---- 容器内自更新 ----
       - SELF_UPDATE=${SELF_UPDATE:-1}
-      - SELF_UPDATE_IMAGE=${SELF_UPDATE_IMAGE:-ghcr.io/tarocats/workbuddy2api-panel:latest}
+      # 跟随「fork 运行时镜像」，不是纯上游的 :latest
+      - SELF_UPDATE_IMAGE=${SELF_UPDATE_IMAGE:-ghcr.io/tarocats/workbuddy2api-panel:latest-fork}
       # 检查间隔（秒），默认 6 小时；另有 0~600 秒随机抖动，避免多台机器同刻拉取
       - SELF_UPDATE_INTERVAL=${SELF_UPDATE_INTERVAL:-21600}
       - SELF_UPDATE_JITTER=${SELF_UPDATE_JITTER:-600}
@@ -49,12 +55,18 @@ services:
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
-      # 宿主机必须先有 config.json（cp config.example.json config.json），
-      # 否则 Docker 会把挂载点建成目录 → 容器启动失败
-      - ./config.json:/app/config.json
-      # 自更新脚本走 bind mount：改脚本不用重建镜像（镜像本身不含它）
-      - ./scripts/selfupdate.py:/app/scripts/selfupdate.py:ro
-      - ./scripts/selfupdate-entrypoint.sh:/app/selfupdate-entrypoint.sh:ro
+      # 宿主机必须先有 config.json（cp config.example.json config.json）。
+      # 这里刻意用长语法 + create_host_path: false：短语法在源文件缺失时会**在宿主机上
+      # 把那个路径默默建成目录**（compose 规范行为），挂进去的是个目录，程序写配置失败
+      # 且看不出原因。这样写会直接报 bind source path does not exist，一眼就知道少做了什么。
+      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      - type: bind
+        source: ./config.json
+        target: /app/config.json
+        bind:
+          create_host_path: false
       # 自更新需要直连 docker daemon 创建/替换容器
       - /var/run/docker.sock:/var/run/docker.sock
+    # 镜像里已经带同样的 ENTRYPOINT，这里写一遍是为了让「误用 :latest」直接报
+    # No such file or directory，而不是静默丢掉自更新能力。
     entrypoint: ["/bin/bash", "/app/selfupdate-entrypoint.sh"]

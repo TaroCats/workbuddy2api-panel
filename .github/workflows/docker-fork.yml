@@ -1,0 +1,135 @@
+name: docker-fork
+
+# fork 专属：在 CI 构建出来的基础镜像之上叠一层「自更新运行时」，产出部署机真正 pull 的镜像。
+#
+# 链条（每一环都只是「上一层 + 一点点」）：
+#   上游提交 → sync-upstream（rebase + push）→ docker-ghcr 构建 :latest（纯上游）
+#            → 本 workflow（workflow_run 完成后触发）→ 构建 :latest-fork（= :latest + 自更新）
+#            → 部署机自更新按 digest 发现 :latest-fork 变了 → 原地换容器
+#
+# 为什么不直接把脚本挂载进容器：compose 短语法在宿主机源文件缺失时会**把源路径建成目录**，
+# 挂进容器就是 `/app/selfupdate-entrypoint.sh: Is a directory`。焊进镜像后宿主机零依赖。
+#
+# 为什么不在这里再派发一次：本 workflow 由基础构建的完成事件触发，宁可等 5 分钟，
+# 也不要抢在基础构建完成前叠层 —— 那样会把「上一次的 :latest」焊进 :latest-fork。
+on:
+  # 基础镜像构建成功后自动叠一层（push / 手动派发 / tag 触发的都算）
+  workflow_run:
+    workflows: ["docker-ghcr"]
+    types: [completed]
+  # 手动兜底：可指定要叠的基础镜像 tag
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 基础镜像 tag（上游构建产物）
+        required: false
+        default: latest
+
+# 同一分支串行；不取消进行中的构建（多架构构建贵，取消会白跑）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # workflow_dispatch 时用输入值；其他事件下为空 → 落到 latest
+  BASE_TAG: ${{ github.event.inputs.base_tag || 'latest' }}
+
+jobs:
+  build:
+    name: 构建 fork 运行时镜像
+    runs-on: ubuntu-latest
+    # 只在基础构建成功时叠层：失败/取消 / PR 触发的构建（不推镜像）都不做，
+    # 避免把半成品或过时的 :latest 焊进 :latest-fork。
+    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request') }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 计算镜像名与 tag
+        id: vars
+        run: |
+          # docker 的 FROM / tag 都不认大写，必须先小写化
+          IMAGE="${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          SHORT_SHA="$(echo '${{ github.sha }}' | cut -c1-7)"
+          BASE="${IMAGE}:${BASE_TAG}"
+          {
+            echo "image=${IMAGE}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "base=${BASE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "部署镜像：${IMAGE}:latest-fork"
+          echo "基础镜像：${BASE}"
+
+      - name: Set up QEMU（arm64 交叉模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 确认基础镜像存在
+        run: |
+          docker buildx imagetools inspect '${{ steps.vars.outputs.base }}' > /dev/null \
+            || { echo "::error::基础镜像不存在或不可拉取：${{ steps.vars.outputs.base }}"; exit 1; }
+          echo "基础镜像 OK"
+          docker buildx imagetools inspect '${{ steps.vars.outputs.base }}' --format '{{json .Manifest}}' \
+            | head -c 400 || true
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.fork
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:latest-fork
+            ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}-fork
+          build-args: |
+            BASE_IMAGE=${{ steps.vars.outputs.base }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 与上游一致：关掉 provenance，避免 ghcr 页面出现 unknown/unknown 架构条目
+          provenance: false
+
+      - name: 冒烟测试（确认脚本真的在镜像里）
+        env:
+          IMG: ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}-fork
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMG"
+
+          echo "=== 镜像 config（ENTRYPOINT 应被本 fork 覆盖，其余继承基础镜像）==="
+          docker image inspect --format 'Entrypoint: {{.Config.Entrypoint}}' "$IMG"
+          docker image inspect --format 'User:       {{.Config.User}}' "$IMG"
+          docker image inspect --format 'WorkingDir: {{.Config.WorkingDir}}' "$IMG"
+          docker image inspect --format 'Ports:      {{.Config.ExposedPorts}}' "$IMG"
+
+          docker image inspect --format '{{.Config.Entrypoint}}' "$IMG" | grep -q 'selfupdate-entrypoint.sh' \
+            || { echo "::error::镜像 ENTRYPOINT 不是 fork 的入口包装"; exit 1; }
+
+          echo "=== 容器内断言（覆盖当初那个 Is a directory 的失败模式）==="
+          docker run --rm --network none --entrypoint /bin/bash "$IMG" -c '
+            set -eu
+            for f in /app/wb2api /app/scripts/selfupdate.py /app/selfupdate-entrypoint.sh; do
+              [ -f "$f" ] || { echo "缺文件：$f"; exit 1; }
+            done
+            [ -x /app/wb2api ] || { echo "/app/wb2api 不可执行"; exit 1; }
+            command -v bash    >/dev/null || { echo "缺 bash";    exit 1; }
+            command -v python3 >/dev/null || { echo "缺 python3"; exit 1; }
+            command -v wget    >/dev/null || echo "  （提示：基础镜像的 HEALTHCHECK 用 wget）"
+            python3 -m py_compile /app/scripts/selfupdate.py
+            bash -n /app/selfupdate-entrypoint.sh
+            echo "容器内自检 SMOKE_OK"
+          '
+          echo "冒烟测试通过：$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMG")"

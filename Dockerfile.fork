@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.fork —— fork 专属镜像层（上游没有这个文件）
+#
+# 只干一件事：在上游 Dockerfile 产出的基础镜像之上，把 fork 的自更新脚本和入口包装
+# 「焊」进镜像里，让部署变成纯 pull —— 宿主机上不需要存在任何脚本文件。
+#
+# 分层：
+#   ghcr.io/<owner>/workbuddy2api-panel:latest        ← 上游 Dockerfile 产出（纯上游，分毫未改）
+#   ghcr.io/<owner>/workbuddy2api-panel:latest-fork   ← 本文件产出（= 上面 + 自更新），部署用这个
+#
+# 为什么非要多这一层：基础镜像来自上游 Dockerfile，里面没有 scripts/selfupdate*.py|sh
+# 和入口包装。早先的版本靠 compose bind mount 把宿主机上的脚本挂进去，结果是
+# 「宿主机文件一丢就挂」—— compose 短语法在源路径不存在时会**在宿主机上把那个路径建成
+# 目录**，挂进容器后报：
+#   /app/selfupdate-entrypoint.sh: /app/selfupdate-entrypoint.sh: Is a directory
+# 焊进镜像后这个失败模式从根上消失。
+ARG BASE_IMAGE=ghcr.io/tarocats/workbuddy2api-panel:latest
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="workbuddy2api-panel-fork" \
+      org.opencontainers.image.description="上游镜像 + fork 自更新运行时（脚本已内置，无需宿主机挂载）" \
+      org.opencontainers.image.source="https://github.com/TaroCats/workbuddy2api-panel"
+
+# 只增文件，不动基础镜像里的任何东西：
+# USER app / WORKDIR /app / HEALTHCHECK / EXPOSE 7863 / 其余 ENV 全部从基础镜像继承。
+# COPY 由 builder 以 root 执行，--chmod 保证 app 用户（uid 10001）也读得到、跑得动。
+COPY --chmod=0755 scripts/selfupdate.py /app/scripts/selfupdate.py
+COPY --chmod=0755 scripts/selfupdate-entrypoint.sh /app/selfupdate-entrypoint.sh
+
+# 入口包装：SELF_UPDATE=1 且能看到 docker.sock 时后台拉起自更新守护，然后 exec /app/wb2api
+# （保持 PID 1 与信号语义不变）。没设 SELF_UPDATE 时行为与基础镜像的 ENTRYPOINT 等价。
+ENTRYPOINT ["/bin/bash", "/app/selfupdate-entrypoint.sh"]
