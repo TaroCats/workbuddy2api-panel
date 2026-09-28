@@ -465,6 +465,16 @@ def do_swap(old_id, new_id, final_name, dry_run=False):
 def build_create_payload(info, image_ref):
     cfg = info.get("Config") or {}
     host = dict(info.get("HostConfig") or {})
+    cid = info.get("Id") or ""
+
+    # hostname：默认是容器 id 的前 12 位（self_container_id 依赖这一点，必须重新生成）。
+    # 只有用户显式设过别的 hostname 才沿用。
+    hostname = cfg.get("Hostname") or ""
+    if hostname and hostname not in (cid, cid[:12]):
+        new_hostname = hostname
+    else:
+        new_hostname = ""
+
     payload = {
         "Image": image_ref,
         "Env": cfg.get("Env"),
@@ -476,8 +486,7 @@ def build_create_payload(info, image_ref):
         "ExposedPorts": cfg.get("ExposedPorts"),
         "Healthcheck": cfg.get("Healthcheck"),
         "StopSignal": cfg.get("StopSignal"),
-        # 留空 → 由 daemon 用新容器 id 生成 hostname（self_container_id 依赖这一点）
-        "Hostname": "",
+        "Hostname": new_hostname,
         "AttachStdin": False,
         "AttachStdout": False,
         "AttachStderr": False,
@@ -486,9 +495,17 @@ def build_create_payload(info, image_ref):
         "StdinOnce": False,
         "HostConfig": host,
     }
+    # 网络别名也要带走：compose 会给容器注册服务名别名，丢了可能影响容器间用服务名互访
     nets = (info.get("NetworkSettings") or {}).get("Networks") or {}
     if nets:
-        payload["NetworkingConfig"] = {"EndpointsConfig": {n: {} for n in nets}}
+        endpoints = {}
+        for net_name, net in nets.items():
+            ep = {}
+            aliases = (net or {}).get("Aliases")
+            if aliases:
+                ep["Aliases"] = aliases
+            endpoints[net_name] = ep
+        payload["NetworkingConfig"] = {"EndpointsConfig": endpoints}
     return {k: v for k, v in payload.items() if v is not None}
 
 
